@@ -2,7 +2,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from itertools import chain
+import itertools
+import random
 
 from ray.tune.error import TuneError
 from ray.tune.experiment import convert_to_experiment_list
@@ -17,25 +18,35 @@ class BasicVariantGenerator(SearchAlgorithm):
     See also: `ray.tune.suggest.variant_generator`.
 
     Example:
-        >>> searcher = BasicVariantGenerator({"experiment": { ... }})
+        >>> searcher = BasicVariantGenerator()
+        >>> searcher.add_configurations({"experiment": { ... }})
         >>> list_of_trials = searcher.next_trials()
         >>> searcher.is_finished == True
     """
 
-    def __init__(self, experiments=None):
-        """Constructs a generator given experiment specifications.
+    def __init__(self, shuffle=False):
+        """Initializes the Variant Generator.
+
+        Arguments:
+            shuffle (bool): Shuffles the generated list of configurations.
+        """
+        self._parser = make_parser()
+        self._trial_generator = []
+        self._counter = 0
+        self._finished = False
+        self._shuffle = shuffle
+
+    def add_configurations(self, experiments):
+        """Chains generator given experiment specifications.
 
         Arguments:
             experiments (Experiment | list | dict): Experiments to run.
         """
         experiment_list = convert_to_experiment_list(experiments)
-        self._parser = make_parser()
-        self._trial_generator = chain.from_iterable([
-            self._generate_trials(experiment.spec, experiment.name)
-            for experiment in experiment_list
-        ])
-        self._counter = 0
-        self._finished = False
+        for experiment in experiment_list:
+            self._trial_generator = itertools.chain(
+                self._trial_generator,
+                self._generate_trials(experiment.spec, experiment.name))
 
     def next_trials(self):
         """Provides Trial objects to be queued into the TrialRunner.
@@ -44,6 +55,8 @@ class BasicVariantGenerator(SearchAlgorithm):
             trials (list): Returns a list of trials.
         """
         trials = list(self._trial_generator)
+        if self._shuffle:
+            random.shuffle(trials)
         self._finished = True
         return trials
 
@@ -61,7 +74,7 @@ class BasicVariantGenerator(SearchAlgorithm):
 
         if "run" not in unresolved_spec:
             raise TuneError("Must specify `run` in {}".format(unresolved_spec))
-        for _ in range(unresolved_spec.get("repeat", 1)):
+        for _ in range(unresolved_spec.get("num_samples", 1)):
             for resolved_vars, spec in generate_variants(unresolved_spec):
                 experiment_tag = str(self._counter)
                 if resolved_vars:

@@ -4,7 +4,7 @@ pendulum-ddpg:
     run: DDPG
     stop:
         episode_reward_mean: -160
-        time_total_s: 600 # 10 minutes
+        timesteps_total: 100000
     config:
         # === Model ===
         actor_hiddens: [64, 64]
@@ -15,13 +15,14 @@ pendulum-ddpg:
         env_config: {}
 
         # === Exploration ===
+        exploration_should_anneal: True
         schedule_max_timesteps: 100000
         timesteps_per_iteration: 600
         exploration_fraction: 0.1
-        exploration_final_eps: 0.02
-        noise_scale: 0.1
-        exploration_theta: 0.15
-        exploration_sigma: 0.2
+        exploration_final_scale: 0.02
+        exploration_ou_noise_scale: 0.1
+        exploration_ou_theta: 0.15
+        exploration_ou_sigma: 0.2
         target_network_update_freq: 0
         tau: 0.001
 
@@ -34,7 +35,7 @@ pendulum-ddpg:
         clip_rewards: False
 
         # === Optimization ===
-        actor_lr: 0.0001
+        actor_lr: 0.001
         critic_lr: 0.001
         use_huber: True
         huber_threshold: 1.0
@@ -47,6 +48,9 @@ pendulum-ddpg:
         num_workers: 0
         num_gpus_per_worker: 0
         optimizer_class: "SyncReplayOptimizer"
-        optimizer_config: {}
         per_worker_exploration: False
         worker_side_prioritization: False
+
+        # === Evaluation ===
+        evaluation_interval: 5
+        evaluation_num_episodes: 10

@@ -1,5 +1,7 @@
 #include "task_dependency_manager.h"
 
+#include "ray/stats/stats.h"
+
 namespace ray {
 
 namespace raylet {
@@ -22,7 +24,7 @@ bool TaskDependencyManager::CheckObjectLocal(const ObjectID &object_id) const {
 }
 
 bool TaskDependencyManager::CheckObjectRequired(const ObjectID &object_id) const {
-  const TaskID task_id = ComputeTaskId(object_id);
+  const TaskID task_id = object_id.task_id();
   auto task_entry = required_tasks_.find(task_id);
   // If there are no subscribed tasks that are dependent on the object, then do
   // nothing.
@@ -74,14 +76,13 @@ void TaskDependencyManager::HandleRemoteDependencyCanceled(const ObjectID &objec
 
 std::vector<TaskID> TaskDependencyManager::HandleObjectLocal(
     const ray::ObjectID &object_id) {
-  RAY_LOG(DEBUG) << "object ready " << object_id.hex();
   // Add the object to the table of locally available objects.
   auto inserted = local_objects_.insert(object_id);
   RAY_CHECK(inserted.second);
 
   // Find any tasks that are dependent on the newly available object.
   std::vector<TaskID> ready_task_ids;
-  auto creating_task_entry = required_tasks_.find(ComputeTaskId(object_id));
+  auto creating_task_entry = required_tasks_.find(object_id.task_id());
   if (creating_task_entry != required_tasks_.end()) {
     auto object_entry = creating_task_entry->second.find(object_id);
     if (object_entry != creating_task_entry->second.end()) {
@@ -106,13 +107,13 @@ std::vector<TaskID> TaskDependencyManager::HandleObjectLocal(
 
 std::vector<TaskID> TaskDependencyManager::HandleObjectMissing(
     const ray::ObjectID &object_id) {
-  // Add the object to the table of locally available objects.
+  // Remove the object from the table of locally available objects.
   auto erased = local_objects_.erase(object_id);
   RAY_CHECK(erased == 1);
 
   // Find any tasks that are dependent on the missing object.
   std::vector<TaskID> waiting_task_ids;
-  TaskID creating_task_id = ComputeTaskId(object_id);
+  TaskID creating_task_id = object_id.task_id();
   auto creating_task_entry = required_tasks_.find(creating_task_id);
   if (creating_task_entry != required_tasks_.end()) {
     auto object_entry = creating_task_entry->second.find(object_id);
@@ -124,6 +125,9 @@ std::vector<TaskID> TaskDependencyManager::HandleObjectMissing(
         // missing.
         if (task_entry.num_missing_dependencies == 0) {
           waiting_task_ids.push_back(dependent_task_id);
+          // During normal execution we should be able to include the check
+          // RAY_CHECK(pending_tasks_.count(dependent_task_id) == 1);
+          // However, this invariant will not hold during unit test execution.
         }
         task_entry.num_missing_dependencies++;
       }
@@ -145,7 +149,7 @@ bool TaskDependencyManager::SubscribeDependencies(
     auto inserted = task_entry.object_dependencies.insert(object_id);
     if (inserted.second) {
       // Get the ID of the task that creates the dependency.
-      TaskID creating_task_id = ComputeTaskId(object_id);
+      TaskID creating_task_id = object_id.task_id();
       // Determine whether the dependency can be fulfilled by the local node.
       if (local_objects_.count(object_id) == 0) {
         // The object is not local.
@@ -167,10 +171,13 @@ bool TaskDependencyManager::SubscribeDependencies(
   return (task_entry.num_missing_dependencies == 0);
 }
 
-void TaskDependencyManager::UnsubscribeDependencies(const TaskID &task_id) {
+bool TaskDependencyManager::UnsubscribeDependencies(const TaskID &task_id) {
   // Remove the task from the table of subscribed tasks.
   auto it = task_dependencies_.find(task_id);
-  RAY_CHECK(it != task_dependencies_.end());
+  if (it == task_dependencies_.end()) {
+    return false;
+  }
+
   const TaskDependencies task_entry = std::move(it->second);
   task_dependencies_.erase(it);
 
@@ -179,7 +186,7 @@ void TaskDependencyManager::UnsubscribeDependencies(const TaskID &task_id) {
     // Remove the task from the list of tasks that are dependent on this
     // object.
     // Get the ID of the task that creates the dependency.
-    TaskID creating_task_id = ComputeTaskId(object_id);
+    TaskID creating_task_id = object_id.task_id();
     auto creating_task_entry = required_tasks_.find(creating_task_id);
     std::vector<TaskID> &dependent_tasks = creating_task_entry->second[object_id];
     auto it = std::find(dependent_tasks.begin(), dependent_tasks.end(), task_id);
@@ -202,6 +209,17 @@ void TaskDependencyManager::UnsubscribeDependencies(const TaskID &task_id) {
   for (const auto &object_id : task_entry.object_dependencies) {
     HandleRemoteDependencyCanceled(object_id);
   }
+
+  return true;
+}
+
+std::vector<TaskID> TaskDependencyManager::GetPendingTasks() const {
+  std::vector<TaskID> keys;
+  keys.reserve(pending_tasks_.size());
+  for (const auto &id_task_pair : pending_tasks_) {
+    keys.push_back(id_task_pair.first);
+  }
+  return keys;
 }
 
 void TaskDependencyManager::TaskPending(const Task &task) {
@@ -262,7 +280,8 @@ void TaskDependencyManager::AcquireTaskLease(const TaskID &task_id) {
       });
 
   it->second.expires_at = now_ms + it->second.lease_period;
-  it->second.lease_period *= 2;
+  it->second.lease_period = std::min(it->second.lease_period * 2,
+                                     RayConfig::instance().max_task_lease_timeout_ms());
 }
 
 void TaskDependencyManager::TaskCanceled(const TaskID &task_id) {
@@ -283,6 +302,64 @@ void TaskDependencyManager::TaskCanceled(const TaskID &task_id) {
       HandleRemoteDependencyRequired(object_entry.first);
     }
   }
+}
+
+void TaskDependencyManager::RemoveTasksAndRelatedObjects(
+    const std::unordered_set<TaskID> &task_ids) {
+  // Collect a list of all the unique objects that these tasks were subscribed
+  // to.
+  std::unordered_set<ObjectID> required_objects;
+  for (auto it = task_ids.begin(); it != task_ids.end(); it++) {
+    auto task_it = task_dependencies_.find(*it);
+    if (task_it != task_dependencies_.end()) {
+      // Add the objects that this task was subscribed to.
+      required_objects.insert(task_it->second.object_dependencies.begin(),
+                              task_it->second.object_dependencies.end());
+    }
+    // The task no longer depends on anything.
+    task_dependencies_.erase(*it);
+    // The task is no longer pending execution.
+    pending_tasks_.erase(*it);
+  }
+
+  // Cancel all of the objects that were required by the removed tasks.
+  for (const auto &object_id : required_objects) {
+    TaskID creating_task_id = object_id.task_id();
+    required_tasks_.erase(creating_task_id);
+    HandleRemoteDependencyCanceled(object_id);
+  }
+
+  // Make sure that the tasks in task_ids no longer have tasks dependent on
+  // them.
+  for (const auto &task_id : task_ids) {
+    RAY_CHECK(required_tasks_.find(task_id) == required_tasks_.end())
+        << "RemoveTasksAndRelatedObjects was called on" << task_id
+        << ", but another task depends on it that was not included in the argument";
+  }
+}
+
+std::string TaskDependencyManager::DebugString() const {
+  std::stringstream result;
+  result << "TaskDependencyManager:";
+  result << "\n- task dep map size: " << task_dependencies_.size();
+  result << "\n- task req map size: " << required_tasks_.size();
+  result << "\n- req objects map size: " << required_objects_.size();
+  result << "\n- local objects map size: " << local_objects_.size();
+  result << "\n- pending tasks map size: " << pending_tasks_.size();
+  return result.str();
+}
+
+void TaskDependencyManager::RecordMetrics() const {
+  stats::TaskDependencyManagerStats().Record(
+      task_dependencies_.size(), {{stats::ValueTypeKey, "num_task_dependencies"}});
+  stats::TaskDependencyManagerStats().Record(
+      required_tasks_.size(), {{stats::ValueTypeKey, "num_required_tasks"}});
+  stats::TaskDependencyManagerStats().Record(
+      required_objects_.size(), {{stats::ValueTypeKey, "num_required_objects"}});
+  stats::TaskDependencyManagerStats().Record(
+      local_objects_.size(), {{stats::ValueTypeKey, "num_local_objects"}});
+  stats::TaskDependencyManagerStats().Record(
+      pending_tasks_.size(), {{stats::ValueTypeKey, "num_pending_tasks"}});
 }
 
 }  // namespace raylet

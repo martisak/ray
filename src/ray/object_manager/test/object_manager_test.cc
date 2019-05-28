@@ -3,7 +3,14 @@
 
 #include "gtest/gtest.h"
 
+#include "ray/status.h"
+
 #include "ray/object_manager/object_manager.h"
+
+namespace {
+std::string store_executable;
+int64_t wait_timeout_ms;
+}
 
 namespace ray {
 
@@ -12,8 +19,6 @@ static inline void flushall_redis(void) {
   freeReplyObject(redisCommand(context, "FLUSHALL"));
   redisFree(context);
 }
-
-std::string store_executable;
 
 class MockServer {
  public:
@@ -24,7 +29,8 @@ class MockServer {
             main_service, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), 0)),
         object_manager_socket_(main_service),
         gcs_client_(gcs_client),
-        object_manager_(main_service, object_manager_config, gcs_client) {
+        object_manager_(main_service, object_manager_config,
+                        std::make_shared<ObjectDirectory>(main_service, gcs_client_)) {
     RAY_CHECK_OK(RegisterGcs(main_service));
     // Start listening for clients.
     DoAcceptObjectManager();
@@ -34,7 +40,6 @@ class MockServer {
 
  private:
   ray::Status RegisterGcs(boost::asio::io_service &io_service) {
-    RAY_RETURN_NOT_OK(gcs_client_->Connect("127.0.0.1", 6379, /*sharding=*/false));
     RAY_RETURN_NOT_OK(gcs_client_->Attach(io_service));
 
     boost::asio::ip::tcp::endpoint endpoint = object_manager_acceptor_.local_endpoint();
@@ -65,9 +70,10 @@ class MockServer {
       object_manager_.ProcessClientMessage(client, message_type, message);
     };
     // Accept a new local client and dispatch it to the node manager.
-    auto new_connection =
-        TcpClientConnection::Create(client_handler, message_handler,
-                                    std::move(object_manager_socket_), "object manager");
+    auto new_connection = TcpClientConnection::Create(
+        client_handler, message_handler, std::move(object_manager_socket_),
+        "object manager", {},
+        static_cast<int64_t>(object_manager::protocol::MessageType::DisconnectClient));
     DoAcceptObjectManager();
   }
 
@@ -115,7 +121,8 @@ class TestObjectManagerBase : public ::testing::Test {
     push_timeout_ms = 1000;
 
     // start first server
-    gcs_client_1 = std::shared_ptr<gcs::AsyncGcsClient>(new gcs::AsyncGcsClient());
+    gcs_client_1 = std::shared_ptr<gcs::AsyncGcsClient>(
+        new gcs::AsyncGcsClient("127.0.0.1", 6379, /*is_test_client=*/true));
     ObjectManagerConfig om_config_1;
     om_config_1.store_socket_name = store_id_1;
     om_config_1.pull_timeout_ms = pull_timeout_ms;
@@ -126,7 +133,8 @@ class TestObjectManagerBase : public ::testing::Test {
     server1.reset(new MockServer(main_service, om_config_1, gcs_client_1));
 
     // start second server
-    gcs_client_2 = std::shared_ptr<gcs::AsyncGcsClient>(new gcs::AsyncGcsClient());
+    gcs_client_2 = std::shared_ptr<gcs::AsyncGcsClient>(
+        new gcs::AsyncGcsClient("127.0.0.1", 6379, /*is_test_client=*/true));
     ObjectManagerConfig om_config_2;
     om_config_2.store_socket_name = store_id_2;
     om_config_2.pull_timeout_ms = pull_timeout_ms;
@@ -137,8 +145,8 @@ class TestObjectManagerBase : public ::testing::Test {
     server2.reset(new MockServer(main_service, om_config_2, gcs_client_2));
 
     // connect to stores.
-    ARROW_CHECK_OK(client1.Connect(store_id_1, "", plasma::kPlasmaDefaultReleaseDelay));
-    ARROW_CHECK_OK(client2.Connect(store_id_2, "", plasma::kPlasmaDefaultReleaseDelay));
+    RAY_ARROW_CHECK_OK(client1.Connect(store_id_1));
+    RAY_ARROW_CHECK_OK(client2.Connect(store_id_2));
   }
 
   void TearDown() {
@@ -163,9 +171,9 @@ class TestObjectManagerBase : public ::testing::Test {
     uint8_t metadata[] = {5};
     int64_t metadata_size = sizeof(metadata);
     std::shared_ptr<Buffer> data;
-    ARROW_CHECK_OK(client.Create(object_id.to_plasma_id(), data_size, metadata,
-                                 metadata_size, &data));
-    ARROW_CHECK_OK(client.Seal(object_id.to_plasma_id()));
+    RAY_ARROW_CHECK_OK(client.Create(object_id.to_plasma_id(), data_size, metadata,
+                                     metadata_size, &data));
+    RAY_ARROW_CHECK_OK(client.Seal(object_id.to_plasma_id()));
     return object_id;
   }
 
@@ -231,13 +239,13 @@ class TestObjectManager : public TestObjectManagerBase {
   void TestNotifications() {
     ray::Status status = ray::Status::OK();
     status = server1->object_manager_.SubscribeObjAdded(
-        [this](const ObjectInfoT &object_info) {
+        [this](const object_manager::protocol::ObjectInfoT &object_info) {
           object_added_handler_1(ObjectID::from_binary(object_info.object_id));
           NotificationTestCompleteIfSatisfied();
         });
     RAY_CHECK_OK(status);
     status = server2->object_manager_.SubscribeObjAdded(
-        [this](const ObjectInfoT &object_info) {
+        [this](const object_manager::protocol::ObjectInfoT &object_info) {
           object_added_handler_2(ObjectID::from_binary(object_info.object_id));
           NotificationTestCompleteIfSatisfied();
         });
@@ -280,12 +288,12 @@ class TestObjectManager : public TestObjectManagerBase {
     // object.
     ObjectID object_1 = WriteDataToClient(client2, data_size);
     ObjectID object_2 = WriteDataToClient(client2, data_size);
-    UniqueID sub_id = ray::ObjectID::from_random();
+    UniqueID sub_id = ray::UniqueID::from_random();
 
     RAY_CHECK_OK(server1->object_manager_.object_directory_->SubscribeObjectLocations(
-        sub_id, object_1,
-        [this, sub_id, object_1, object_2](const std::vector<ray::ClientID> &clients,
-                                           const ray::ObjectID &object_id) {
+        sub_id, object_1, [this, sub_id, object_1, object_2](
+                              const ray::ObjectID &object_id,
+                              const std::unordered_set<ray::ClientID> &clients) {
           if (!clients.empty()) {
             TestWaitWhileSubscribed(sub_id, object_1, object_2);
           }
@@ -325,32 +333,33 @@ class TestObjectManager : public TestObjectManagerBase {
   }
 
   void NextWaitTest() {
+    int data_size = 600;
     current_wait_test += 1;
     switch (current_wait_test) {
     case 0: {
       // Ensure timeout_ms = 0 is handled correctly.
       // Out of 5 objects, we expect 3 ready objects and 2 remaining objects.
-      TestWait(100, 5, 3, /*timeout_ms=*/0, false, false);
+      TestWait(data_size, 5, 3, /*timeout_ms=*/0, false, false);
     } break;
     case 1: {
       // Ensure timeout_ms = 1000 is handled correctly.
       // Out of 5 objects, we expect 3 ready objects and 2 remaining objects.
-      TestWait(100, 5, 3, /*timeout_ms=*/1000, false, false);
+      TestWait(data_size, 5, 3, wait_timeout_ms, false, false);
     } break;
     case 2: {
       // Generate objects locally to ensure local object code-path works properly.
       // Out of 5 objects, we expect 3 ready objects and 2 remaining objects.
-      TestWait(100, 5, 3, 1000, false, /*test_local=*/true);
+      TestWait(data_size, 5, 3, wait_timeout_ms, false, /*test_local=*/true);
     } break;
     case 3: {
       // Wait on an object that's never registered with GCS to ensure timeout works
       // properly.
-      TestWait(100, /*num_objects=*/5, /*required_objects=*/6, 1000,
+      TestWait(data_size, /*num_objects=*/5, /*required_objects=*/6, wait_timeout_ms,
                /*include_nonexistent=*/true, false);
     } break;
     case 4: {
       // Ensure infinite time code-path works properly.
-      TestWait(100, 5, 5, /*timeout_ms=*/-1, false, false);
+      TestWait(data_size, 5, 5, /*timeout_ms=*/-1, false, false);
     } break;
     }
   }
@@ -446,13 +455,15 @@ class TestObjectManager : public TestObjectManagerBase {
     RAY_LOG(DEBUG) << "\n"
                    << "Server client ids:"
                    << "\n";
-    const ClientTableDataT &data = gcs_client_1->client_table().GetClient(client_id_1);
-    RAY_LOG(DEBUG) << (ClientID::from_binary(data.client_id) == ClientID::nil());
+    ClientTableDataT data;
+    gcs_client_1->client_table().GetClient(client_id_1, data);
+    RAY_LOG(DEBUG) << (ClientID::from_binary(data.client_id).is_nil());
     RAY_LOG(DEBUG) << "Server 1 ClientID=" << ClientID::from_binary(data.client_id);
     RAY_LOG(DEBUG) << "Server 1 ClientIp=" << data.node_manager_address;
     RAY_LOG(DEBUG) << "Server 1 ClientPort=" << data.node_manager_port;
     ASSERT_EQ(client_id_1, ClientID::from_binary(data.client_id));
-    const ClientTableDataT &data2 = gcs_client_1->client_table().GetClient(client_id_2);
+    ClientTableDataT data2;
+    gcs_client_1->client_table().GetClient(client_id_2, data2);
     RAY_LOG(DEBUG) << "Server 2 ClientID=" << ClientID::from_binary(data2.client_id);
     RAY_LOG(DEBUG) << "Server 2 ClientIp=" << data2.node_manager_address;
     RAY_LOG(DEBUG) << "Server 2 ClientPort=" << data2.node_manager_port;
@@ -461,6 +472,7 @@ class TestObjectManager : public TestObjectManagerBase {
 };
 
 TEST_F(TestObjectManager, StartTestObjectManager) {
+  // TODO: Break this test suite into unit tests.
   auto AsyncStartTests = main_service.wrap([this]() { WaitConnections(); });
   AsyncStartTests();
   main_service.run();
@@ -470,6 +482,7 @@ TEST_F(TestObjectManager, StartTestObjectManager) {
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
-  ray::store_executable = std::string(argv[1]);
+  store_executable = std::string(argv[1]);
+  wait_timeout_ms = std::stoi(std::string(argv[2]));
   return RUN_ALL_TESTS();
 }

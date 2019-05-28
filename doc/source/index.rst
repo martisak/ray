@@ -7,7 +7,7 @@ Ray
     <a href="https://github.com/ray-project/ray"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://camo.githubusercontent.com/365986a132ccd6a44c23a9169022c0b5c890c387/68747470733a2f2f73332e616d617a6f6e6177732e636f6d2f6769746875622f726962626f6e732f666f726b6d655f72696768745f7265645f6161303030302e706e67" alt="Fork me on GitHub" data-canonical-src="https://s3.amazonaws.com/github/ribbons/forkme_right_red_aa0000.png"></a>
   </embed>
 
-*Ray is a flexible, high-performance distributed execution framework.*
+*Ray is a fast and simple framework for building and running distributed applications.*
 
 
 Ray is easy to install: ``pip install ray``
@@ -32,7 +32,7 @@ Example Use
 |  results = [f() for i in range(4)]             |  results = ray.get([f.remote() for i in range(4)]) |
 +------------------------------------------------+----------------------------------------------------+
 
-
+To launch a Ray cluster, either privately, on AWS, or on GCP, `follow these instructions <autoscaling.html>`_.
 
 View the `codebase on GitHub`_.
 
@@ -40,11 +40,12 @@ View the `codebase on GitHub`_.
 
 Ray comes with libraries that accelerate deep learning and reinforcement learning development:
 
-- `Ray Tune`_: Hyperparameter Optimization Framework
-- `Ray RLlib`_: Scalable Reinforcement Learning
+- `Tune`_: Scalable Hyperparameter Search
+- `RLlib`_: Scalable Reinforcement Learning
+- `Distributed Training <distributed_sgd.html>`__
 
-.. _`Ray Tune`: tune.html
-.. _`Ray RLlib`: rllib.html
+.. _`Tune`: tune.html
+.. _`RLlib`: rllib.html
 
 
 .. toctree::
@@ -52,6 +53,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    :caption: Installation
 
    installation.rst
+   deploy-on-kubernetes.rst
    install-on-docker.rst
    installation-troubleshooting.rst
 
@@ -63,33 +65,49 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    api.rst
    actors.rst
    using-ray-with-gpus.rst
-   webui.rst
+   signals.rst
+   async_api.rst
 
 .. toctree::
    :maxdepth: 1
-   :caption: Ray Tune
+   :caption: Cluster Usage
+
+   autoscaling.rst
+   using-ray-on-a-cluster.rst
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Tune
 
    tune.rst
-   tune-config.rst
-   hyperband.rst
-   pbt.rst
+   tune-usage.rst
+   tune-schedulers.rst
+   tune-searchalg.rst
+   tune-package-ref.rst
+   tune-design.rst
+   tune-examples.rst
+   tune-contrib.rst
 
 .. toctree::
    :maxdepth: 1
-   :caption: Ray RLlib
+   :caption: RLlib
 
    rllib.rst
    rllib-training.rst
    rllib-env.rst
-   rllib-algorithms.rst
    rllib-models.rst
+   rllib-algorithms.rst
+   rllib-offline.rst
    rllib-concepts.rst
+   rllib-examples.rst
+   rllib-dev.rst
    rllib-package-ref.rst
 
 .. toctree::
    :maxdepth: 1
-   :caption: Pandas on Ray
+   :caption: Other Libraries
 
+   distributed_sgd.rst
    pandas_on_ray.rst
 
 .. toctree::
@@ -99,6 +117,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    example-rl-pong.rst
    example-policy-gradient.rst
    example-parameter-server.rst
+   example-newsreader.rst
    example-resnet.rst
    example-a3c.rst
    example-lbfgs.rst
@@ -116,16 +135,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    fault-tolerance.rst
    plasma-object-store.rst
    resources.rst
-   redis-memory-management.rst
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Cluster Usage
-
-   autoscaling.rst
-   using-ray-on-a-cluster.rst
-   using-ray-on-a-large-cluster.rst
-   using-ray-and-docker-on-a-cluster.md
+   tempfile.rst
 
 .. toctree::
    :maxdepth: 1
@@ -133,6 +143,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
 
    troubleshooting.rst
    user-profiling.rst
+   security.rst
    development.rst
    profiling.rst
    contact.rst

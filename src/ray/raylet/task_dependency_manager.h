@@ -61,7 +61,8 @@ class TaskDependencyManager {
   /// then they will be canceled.
   ///
   /// \param task_id The ID of the task whose dependencies to unsubscribe from.
-  void UnsubscribeDependencies(const TaskID &task_id);
+  /// \return Whether the task was subscribed before.
+  bool UnsubscribeDependencies(const TaskID &task_id);
 
   /// Mark that the given task is pending execution. Any objects that it creates
   /// are now considered to be pending creation. If there are any subscribed
@@ -98,6 +99,28 @@ class TaskDependencyManager {
   /// previously had all of their dependencies fulfilled, but are now missing
   /// this object dependency.
   std::vector<TaskID> HandleObjectMissing(const ray::ObjectID &object_id);
+
+  /// Get a list of all Tasks currently marked as pending object dependencies in the task
+  /// dependency manager.
+  ///
+  /// \return Return a vector of TaskIDs for tasks registered as pending.
+  std::vector<TaskID> GetPendingTasks() const;
+
+  /// Remove all of the tasks specified. These tasks will no longer be
+  /// considered pending and the objects they depend on will no longer be
+  /// required.
+  ///
+  /// \param task_ids The collection of task IDs. For a given task in this set,
+  /// all tasks that depend on the task must also be included in the set.
+  void RemoveTasksAndRelatedObjects(const std::unordered_set<TaskID> &task_ids);
+
+  /// Returns debug string for class.
+  ///
+  /// \return string.
+  std::string DebugString() const;
+
+  /// Record metrics.
+  void RecordMetrics() const;
 
  private:
   using ObjectDependencyMap = std::unordered_map<ray::ObjectID, std::vector<ray::TaskID>>;

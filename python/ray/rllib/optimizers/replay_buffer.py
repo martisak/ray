@@ -7,12 +7,15 @@ import random
 import sys
 
 from ray.rllib.optimizers.segment_tree import SumSegmentTree, MinSegmentTree
+from ray.rllib.utils.annotations import DeveloperAPI
 from ray.rllib.utils.compression import unpack_if_needed
 from ray.rllib.utils.window_stat import WindowStat
 
 
+@DeveloperAPI
 class ReplayBuffer(object):
-    def __init__(self, size, clip_rewards):
+    @DeveloperAPI
+    def __init__(self, size):
         """Create Prioritized Replay buffer.
 
         Parameters
@@ -30,15 +33,12 @@ class ReplayBuffer(object):
         self._num_sampled = 0
         self._evicted_hit_stats = WindowStat("evicted_hit", 1000)
         self._est_size_bytes = 0
-        self._clip_rewards = clip_rewards
 
     def __len__(self):
         return len(self._storage)
 
+    @DeveloperAPI
     def add(self, obs_t, action, reward, obs_tp1, done, weight):
-        if self._clip_rewards:
-            reward = np.sign(reward)
-
         data = (obs_t, action, reward, obs_tp1, done)
         self._num_added += 1
 
@@ -68,6 +68,7 @@ class ReplayBuffer(object):
         return (np.array(obses_t), np.array(actions), np.array(rewards),
                 np.array(obses_tp1), np.array(dones))
 
+    @DeveloperAPI
     def sample(self, batch_size):
         """Sample a batch of experiences.
 
@@ -97,19 +98,23 @@ class ReplayBuffer(object):
         self._num_sampled += batch_size
         return self._encode_sample(idxes)
 
-    def stats(self):
+    @DeveloperAPI
+    def stats(self, debug=False):
         data = {
             "added_count": self._num_added,
             "sampled_count": self._num_sampled,
             "est_size_bytes": self._est_size_bytes,
             "num_entries": len(self._storage),
         }
-        data.update(self._evicted_hit_stats.stats())
+        if debug:
+            data.update(self._evicted_hit_stats.stats())
         return data
 
 
+@DeveloperAPI
 class PrioritizedReplayBuffer(ReplayBuffer):
-    def __init__(self, size, alpha, clip_rewards):
+    @DeveloperAPI
+    def __init__(self, size, alpha):
         """Create Prioritized Replay buffer.
 
         Parameters
@@ -125,7 +130,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         --------
         ReplayBuffer.__init__
         """
-        super(PrioritizedReplayBuffer, self).__init__(size, clip_rewards)
+        super(PrioritizedReplayBuffer, self).__init__(size)
         assert alpha > 0
         self._alpha = alpha
 
@@ -138,10 +143,9 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self._max_priority = 1.0
         self._prio_change_stats = WindowStat("reprio", 1000)
 
+    @DeveloperAPI
     def add(self, obs_t, action, reward, obs_tp1, done, weight):
         """See ReplayBuffer.store_effect"""
-        if self._clip_rewards:
-            reward = np.sign(reward)
 
         idx = self._next_idx
         super(PrioritizedReplayBuffer, self).add(obs_t, action, reward,
@@ -155,12 +159,12 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         res = []
         for _ in range(batch_size):
             # TODO(szymon): should we ensure no repeats?
-            mass = random.random() * self._it_sum.sum(0,
-                                                      len(self._storage) - 1)
+            mass = random.random() * self._it_sum.sum(0, len(self._storage))
             idx = self._it_sum.find_prefixsum_idx(mass)
             res.append(idx)
         return res
 
+    @DeveloperAPI
     def sample(self, batch_size, beta):
         """Sample a batch of experiences.
 
@@ -214,6 +218,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         encoded_sample = self._encode_sample(idxes)
         return tuple(list(encoded_sample) + [weights, idxes])
 
+    @DeveloperAPI
     def update_priorities(self, idxes, priorities):
         """Update priorities of sampled transitions.
 
@@ -240,7 +245,9 @@ class PrioritizedReplayBuffer(ReplayBuffer):
 
             self._max_priority = max(self._max_priority, priority)
 
-    def stats(self):
-        parent = ReplayBuffer.stats(self)
-        parent.update(self._prio_change_stats.stats())
+    @DeveloperAPI
+    def stats(self, debug=False):
+        parent = ReplayBuffer.stats(self, debug)
+        if debug:
+            parent.update(self._prio_change_stats.stats())
         return parent

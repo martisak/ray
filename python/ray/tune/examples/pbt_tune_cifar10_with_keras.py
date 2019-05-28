@@ -23,10 +23,9 @@ from tensorflow.python.keras.models import Model
 from tensorflow.python.keras.preprocessing.image import ImageDataGenerator
 
 import ray
-from ray.tune import grid_search, run_experiments
-from ray.tune import register_trainable
+from ray.tune import grid_search, run, sample_from
 from ray.tune import Trainable
-from ray.tune.pbt import PopulationBasedTraining
+from ray.tune.schedulers import PopulationBasedTraining
 
 num_classes = 10
 
@@ -106,12 +105,13 @@ class Cifar10Model(Trainable):
         model = Model(inputs=x, outputs=y, name="model1")
         return model
 
-    def _setup(self):
+    def _setup(self, config):
         self.train_data, self.test_data = self._read_data()
         x_train = self.train_data[0]
         model = self._build_model(x_train.shape[1:])
 
-        opt = tf.keras.optimizers.Adadelta()
+        opt = tf.keras.optimizers.Adadelta(
+            lr=self.config["lr"], decay=self.config["decay"])
         model.compile(
             loss="categorical_crossentropy",
             optimizer=opt,
@@ -179,10 +179,8 @@ if __name__ == "__main__":
         "--smoke-test", action="store_true", help="Finish quickly for testing")
     args, _ = parser.parse_known_args()
 
-    register_trainable("train_cifar10", Cifar10Model)
     train_spec = {
-        "run": "train_cifar10",
-        "trial_resources": {
+        "resources_per_trial": {
             "cpu": 1,
             "gpu": 1
         },
@@ -194,10 +192,10 @@ if __name__ == "__main__":
             "epochs": 1,
             "batch_size": 64,
             "lr": grid_search([10**-4, 10**-5]),
-            "decay": lambda spec: spec.config.lr / 100.0,
+            "decay": sample_from(lambda spec: spec.config.lr / 100.0),
             "dropout": grid_search([0.25, 0.5]),
         },
-        "repeat": 4,
+        "num_samples": 4,
     }
 
     if args.smoke_test:
@@ -214,4 +212,4 @@ if __name__ == "__main__":
             "dropout": lambda _: np.random.uniform(0, 1),
         })
 
-    run_experiments({"pbt_cifar10": train_spec}, scheduler=pbt)
+    run(Cifar10Model, name="pbt_cifar10", scheduler=pbt, **train_spec)

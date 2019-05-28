@@ -4,7 +4,6 @@
 #include <map>
 #include <string>
 
-#include "plasma/events.h"
 #include "ray/gcs/asio.h"
 #include "ray/gcs/tables.h"
 #include "ray/id.h"
@@ -24,24 +23,23 @@ class RAY_EXPORT AsyncGcsClient {
   /// Attach() must be called. To read and write from the GCS tables requires a
   /// further call to Connect() to the client table.
   ///
-  /// \param client_id The ID to assign to the client.
-  /// \param command_type GCS command type.  If CommandType::kChain, chain-replicated
-  /// versions of the tables might be used, if available.
-  AsyncGcsClient(const ClientID &client_id, CommandType command_type);
-  AsyncGcsClient(const ClientID &client_id);
-  AsyncGcsClient(CommandType command_type);
-  AsyncGcsClient();
-
-  /// Connect to the GCS.
-  ///
   /// \param address The GCS IP address.
   /// \param port The GCS port.
   /// \param sharding If true, use sharded redis for the GCS.
-  /// \return Status.
-  Status Connect(const std::string &address, int port, bool sharding);
-  /// Attach this client to a plasma event loop. Note that only
-  /// one event loop should be attached at a time.
-  Status Attach(plasma::EventLoop &event_loop);
+  /// \param client_id The ID to assign to the client.
+  /// \param command_type GCS command type.  If CommandType::kChain, chain-replicated
+  /// versions of the tables might be used, if available.
+  AsyncGcsClient(const std::string &address, int port, const ClientID &client_id,
+                 CommandType command_type, bool is_test_client,
+                 const std::string &redis_password);
+  AsyncGcsClient(const std::string &address, int port, const ClientID &client_id,
+                 bool is_test_client, const std::string &password);
+  AsyncGcsClient(const std::string &address, int port, CommandType command_type);
+  AsyncGcsClient(const std::string &address, int port, CommandType command_type,
+                 bool is_test_client);
+  AsyncGcsClient(const std::string &address, int port, const std::string &password);
+  AsyncGcsClient(const std::string &address, int port, bool is_test_client);
+
   /// Attach this client to an asio event loop. Note that only
   /// one event loop should be attached at a time.
   Status Attach(boost::asio::io_service &io_service);
@@ -52,16 +50,18 @@ class RAY_EXPORT AsyncGcsClient {
   inline CustomSerializerTable &custom_serializer_table();
   inline ConfigTable &config_table();
   ObjectTable &object_table();
-  TaskTable &task_table();
   raylet::TaskTable &raylet_task_table();
   ActorTable &actor_table();
   TaskReconstructionLog &task_reconstruction_log();
   TaskLeaseTable &task_lease_table();
   ClientTable &client_table();
   HeartbeatTable &heartbeat_table();
+  HeartbeatBatchTable &heartbeat_batch_table();
   ErrorTable &error_table();
   DriverTable &driver_table();
   ProfileTable &profile_table();
+  ActorCheckpointTable &actor_checkpoint_table();
+  ActorCheckpointIdTable &actor_checkpoint_id_table();
 
   // We also need something to export generic code to run on workers from the
   // driver (to set the PYTHONPATH)
@@ -71,26 +71,33 @@ class RAY_EXPORT AsyncGcsClient {
   Status GetExport(const std::string &driver_id, int64_t export_index,
                    const GetExportCallback &done_callback);
 
-  std::shared_ptr<RedisContext> context() { return context_; }
+  std::vector<std::shared_ptr<RedisContext>> shard_contexts() { return shard_contexts_; }
   std::shared_ptr<RedisContext> primary_context() { return primary_context_; }
+
+  /// Returns debug string for class.
+  ///
+  /// \return string.
+  std::string DebugString() const;
 
  private:
   std::unique_ptr<FunctionTable> function_table_;
   std::unique_ptr<ClassTable> class_table_;
   std::unique_ptr<ObjectTable> object_table_;
-  std::unique_ptr<TaskTable> task_table_;
   std::unique_ptr<raylet::TaskTable> raylet_task_table_;
   std::unique_ptr<ActorTable> actor_table_;
   std::unique_ptr<TaskReconstructionLog> task_reconstruction_log_;
   std::unique_ptr<TaskLeaseTable> task_lease_table_;
   std::unique_ptr<HeartbeatTable> heartbeat_table_;
+  std::unique_ptr<HeartbeatBatchTable> heartbeat_batch_table_;
   std::unique_ptr<ErrorTable> error_table_;
   std::unique_ptr<ProfileTable> profile_table_;
   std::unique_ptr<ClientTable> client_table_;
+  std::unique_ptr<ActorCheckpointTable> actor_checkpoint_table_;
+  std::unique_ptr<ActorCheckpointIdTable> actor_checkpoint_id_table_;
   // The following contexts write to the data shard
-  std::shared_ptr<RedisContext> context_;
-  std::unique_ptr<RedisAsioClient> asio_async_client_;
-  std::unique_ptr<RedisAsioClient> asio_subscribe_client_;
+  std::vector<std::shared_ptr<RedisContext>> shard_contexts_;
+  std::vector<std::unique_ptr<RedisAsioClient>> shard_asio_async_clients_;
+  std::vector<std::unique_ptr<RedisAsioClient>> shard_asio_subscribe_clients_;
   // The following context writes everything to the primary shard
   std::shared_ptr<RedisContext> primary_context_;
   std::unique_ptr<DriverTable> driver_table_;
@@ -102,10 +109,10 @@ class RAY_EXPORT AsyncGcsClient {
 class SyncGcsClient {
   Status LogEvent(const std::string &key, const std::string &value, double timestamp);
   Status NotifyError(const std::map<std::string, std::string> &error_info);
-  Status RegisterFunction(const JobID &job_id, const FunctionID &function_id,
+  Status RegisterFunction(const DriverID &driver_id, const FunctionID &function_id,
                           const std::string &language, const std::string &name,
                           const std::string &data);
-  Status RetrieveFunction(const JobID &job_id, const FunctionID &function_id,
+  Status RetrieveFunction(const DriverID &driver_id, const FunctionID &function_id,
                           std::string *name, std::string *data);
 
   Status AddExport(const std::string &driver_id, std::string &export_data);

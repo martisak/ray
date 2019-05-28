@@ -15,10 +15,13 @@ enum TablePrefix:int {
   FUNCTION,
   TASK_RECONSTRUCTION,
   HEARTBEAT,
+  HEARTBEAT_BATCH,
   ERROR_INFO,
   DRIVER,
   PROFILE,
   TASK_LEASE,
+  ACTOR_CHECKPOINT,
+  ACTOR_CHECKPOINT_ID,
 }
 
 // The channel that Add operations to the Table should be published on, if any.
@@ -30,12 +33,93 @@ enum TablePubsub:int {
   OBJECT,
   ACTOR,
   HEARTBEAT,
+  HEARTBEAT_BATCH,
   ERROR_INFO,
   TASK_LEASE,
   DRIVER,
 }
 
+// Enum for the entry type in the ClientTable
+enum EntryType:int {
+  INSERTION = 0,
+  DELETION,
+  RES_CREATEUPDATE,
+  RES_DELETE,
+}
+
+table Arg {
+  // Object ID for pass-by-reference arguments. Normally there is only one
+  // object ID in this list which represents the object that is being passed.
+  // However to support reducers in a MapReduce workload, we also support
+  // passing multiple object IDs for each argument.
+  // Note that this is a long string that concatenate all of the object IDs.
+  object_ids: string;
+  // Data for pass-by-value arguments.
+  data: string;
+}
+
+table TaskInfo {
+  // ID of the driver that created this task.
+  driver_id: string;
+  // Task ID of the task.
+  task_id: string;
+  // Task ID of the parent task.
+  parent_task_id: string;
+  // A count of the number of tasks submitted by the parent task before this one.
+  parent_counter: int;
+  // The ID of the actor to create if this is an actor creation task.
+  actor_creation_id: string;
+  // The dummy object ID of the actor creation task if this is an actor method.
+  actor_creation_dummy_object_id: string;
+  // The max number of times this actor should be recontructed.
+  // If this number of 0 or negative, the actor won't be reconstructed on failure.
+  max_actor_reconstructions: int;
+  // Actor ID of the task. This is the actor that this task is executed on
+  // or NIL_ACTOR_ID if the task is just a normal task.
+  actor_id: string;
+  // The ID of the handle that was used to submit the task. This should be
+  // unique across handles with the same actor_id.
+  actor_handle_id: string;
+  // Number of tasks that have been submitted to this actor so far.
+  actor_counter: int;
+  // If this is an actor task, then this will be populated with all of the new
+  // actor handles that were forked from this handle since the last task on
+  // this handle was submitted.
+  // Note that this is a long string that concatenate all of the new_actor_handle IDs.
+  new_actor_handles: string;
+  // Task arguments.
+  args: [Arg];
+  // Number of return objects.
+  num_returns: int;
+  // The required_resources vector indicates the quantities of the different
+  // resources required by this task.
+  required_resources: [ResourcePair];
+  // The resources required for placing this task on a node. If this is empty,
+  // then the placement resources are equal to the required_resources.
+  required_placement_resources: [ResourcePair];
+  // The language that this task belongs to.
+  language: Language;
+  // Function descriptor, which is a list of strings that can
+  // uniquely describe a function.
+  // For a Python function, it should be: [module_name, class_name, function_name]
+  // For a Java function, it should be: [class_name, method_name, type_descriptor]
+  function_descriptor: [string];
+}
+
+table ResourcePair {
+  // The name of the resource.
+  key: string;
+  // The quantity of the resource.
+  value: double;
+}
+
+enum GcsTableNotificationMode:int {
+  APPEND_OR_ADD = 0,
+  REMOVE,
+}
+
 table GcsTableEntry {
+  notification_mode: GcsTableNotificationMode;
   id: string;
   entries: [string];
 }
@@ -51,10 +135,6 @@ table ObjectTableData {
   object_size: long;
   // The node manager ID that this object appeared on or was evicted by.
   manager: string;
-  // Whether this entry is an addition or a deletion.
-  is_eviction: bool;
-  // The number of times this object has been evicted from this node so far.
-  num_evictions: int;
 }
 
 table TaskReconstructionData {
@@ -78,11 +158,11 @@ enum SchedulingState:int {
 table TaskTableData {
   // The state of the task.
   scheduling_state: SchedulingState;
-  // A local scheduler ID.
-  scheduler_id: string;
+  // A raylet ID.
+  raylet_id: string;
   // A string of bytes representing the task's TaskExecutionDependencies.
   execution_dependencies: string;
-  // The number of times the task was spilled back by local schedulers.
+  // The number of times the task was spilled back by raylets.
   spillback_count: long;
   // A string of bytes representing the task specification.
   task_info: string;
@@ -91,12 +171,22 @@ table TaskTableData {
 }
 
 table TaskTableTestAndUpdate {
-  test_scheduler_id: string;
+  test_raylet_id: string;
   test_state_bitmask: SchedulingState;
   update_state: SchedulingState;
 }
 
 table ClassTableData {
+}
+
+enum ActorState:int {
+  // Actor is alive.
+  ALIVE = 0,
+  // Actor is dead, now being reconstructed.
+  // After reconstruction finishes, the state will become alive again.
+  RECONSTRUCTING = 1,
+  // Actor is already dead and won't be reconstructed.
+  DEAD = 2
 }
 
 table ActorTableData {
@@ -110,11 +200,17 @@ table ActorTableData {
   driver_id: string;
   // The ID of the node manager that created the actor.
   node_manager_id: string;
+  // Current state of this actor.
+  state: ActorState;
+  // Max number of times this actor should be reconstructed.
+  max_reconstructions: int;
+  // Remaining number of reconstructions.
+  remaining_reconstructions: int;
 }
 
 table ErrorTableData {
-  // The ID of the job that the error is for.
-  job_id: string;
+  // The ID of the driver that the error is for.
+  driver_id: string;
   // The type of the error.
   type: string;
   // The error message.
@@ -178,9 +274,8 @@ table ClientTableData {
   // The port at which the client's object manager is listening for TCP
   // connections from other object managers.
   object_manager_port: int;
-  // True if the message is about the addition of a client and false if it is
-  // about the deletion of a client.
-  is_insertion: bool;
+  // Enum to store the entry type in the log
+  entry_type: EntryType = INSERTION;
   resources_total_label: [string];
   resources_total_capacity: [double];
 }
@@ -194,6 +289,13 @@ table HeartbeatTableData {
   // Total resource capacity configured for this node manager.
   resources_total_label: [string];
   resources_total_capacity: [double];
+  // Aggregate outstanding resource load on this node manager.
+  resource_load_label: [string];
+  resource_load_capacity: [double];
+}
+
+table HeartbeatBatchTableData {
+  batch: [HeartbeatTableData];
 }
 
 // Data for a lease on task execution.
@@ -213,4 +315,55 @@ table DriverTableData {
   driver_id: string;
   // Whether it's dead.
   is_dead: bool;
+}
+
+// This table stores the actor checkpoint data. An actor checkpoint
+// is the snapshot of an actor's state in the actor registration.
+// See `actor_registration.h` for more detailed explanation of these fields.
+table ActorCheckpointData {
+  // ID of this actor.
+  actor_id: string;
+  // The dummy object ID of actor's most recently executed task.
+  execution_dependency: string;
+  // A list of IDs of this actor's handles.
+  handle_ids: [string];
+  // The task counters of the above handles.
+  task_counters: [long];
+  // The frontier dependencies of the above handles.
+  frontier_dependencies: [string];
+  // A list of unreleased dummy objects from this actor.
+  unreleased_dummy_objects: [string];
+  // The numbers of dependencies for the above unreleased dummy objects.
+  num_dummy_object_dependencies: [int];
+}
+
+// This table stores the actor-to-available-checkpoint-ids mapping.
+table ActorCheckpointIdData {
+  // ID of this actor.
+  actor_id: string;
+  // IDs of this actor's available checkpoints.
+  // Note, this is a long string that concatenates all the IDs.
+  checkpoint_ids: string;
+  // A list of the timestamps for each of the above `checkpoint_ids`.
+  timestamps: [long];
+}
+
+// This enum type is used as object's metadata to indicate the object's creating
+// task has failed because of a certain error.
+// TODO(hchen): We may want to make these errors more specific. E.g., we may want
+// to distinguish between intentional and expected actor failures, and between
+// worker process failure and node failure.
+enum ErrorType:int {
+  // Indicates that a task failed because the worker died unexpectedly while executing it.
+  WORKER_DIED = 1,
+  // Indicates that a task failed because the actor died unexpectedly before finishing it.
+  ACTOR_DIED = 2,
+  // Indicates that an object is lost and cannot be reconstructed.
+  // Note, this currently only happens to actor objects. When the actor's state is already
+  // after the object's creating task, the actor cannot re-run the task.
+  // TODO(hchen): we may want to reuse this error type for more cases. E.g.,
+  // 1) A object that was put by the driver.
+  // 2) The object's creating task is already cleaned up from GCS (this currently
+  //    crashes raylet).
+  OBJECT_UNRECONSTRUCTABLE = 3,
 }

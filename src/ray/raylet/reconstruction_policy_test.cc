@@ -19,7 +19,7 @@ class MockObjectDirectory : public ObjectDirectoryInterface {
   MockObjectDirectory() {}
 
   ray::Status LookupLocations(const ObjectID &object_id,
-                              const OnLocationsFound &callback) {
+                              const OnLocationsFound &callback) override {
     callbacks_.push_back({object_id, callback});
     return ray::Status::OK();
   }
@@ -27,31 +27,48 @@ class MockObjectDirectory : public ObjectDirectoryInterface {
   void FlushCallbacks() {
     for (const auto &callback : callbacks_) {
       const ObjectID object_id = callback.first;
-      callback.second(locations_[object_id], object_id);
+      auto it = locations_.find(object_id);
+      if (it == locations_.end()) {
+        callback.second(object_id, std::unordered_set<ray::ClientID>());
+      } else {
+        callback.second(object_id, it->second);
+      }
     }
     callbacks_.clear();
   }
 
-  void SetObjectLocations(const ObjectID &object_id, std::vector<ClientID> locations) {
+  void SetObjectLocations(const ObjectID &object_id,
+                          const std::unordered_set<ClientID> &locations) {
     locations_[object_id] = locations;
   }
 
+  void HandleClientRemoved(const ClientID &client_id) override {
+    for (auto &locations : locations_) {
+      locations.second.erase(client_id);
+    }
+  }
+
+  std::string DebugString() const override { return ""; }
+
   MOCK_METHOD0(RegisterBackend, void(void));
-  MOCK_METHOD3(GetInformation, ray::Status(const ClientID &, const InfoSuccessCallback &,
-                                           const InfoFailureCallback &));
+  MOCK_METHOD0(GetLocalClientID, ray::ClientID());
+  MOCK_CONST_METHOD1(LookupRemoteConnectionInfo, void(RemoteConnectionInfo &));
+  MOCK_CONST_METHOD0(LookupAllRemoteConnections, std::vector<RemoteConnectionInfo>());
   MOCK_METHOD3(SubscribeObjectLocations,
                ray::Status(const ray::UniqueID &, const ObjectID &,
                            const OnLocationsFound &));
   MOCK_METHOD2(UnsubscribeObjectLocations,
                ray::Status(const ray::UniqueID &, const ObjectID &));
   MOCK_METHOD3(ReportObjectAdded,
-               ray::Status(const ObjectID &, const ClientID &, const ObjectInfoT &));
-  MOCK_METHOD2(ReportObjectRemoved, ray::Status(const ObjectID &, const ClientID &));
-  MOCK_METHOD1(RunFunctionForEachClient, void(const InfoSuccessCallback &success_cb));
+               ray::Status(const ObjectID &, const ClientID &,
+                           const object_manager::protocol::ObjectInfoT &));
+  MOCK_METHOD3(ReportObjectRemoved,
+               ray::Status(const ObjectID &, const ClientID &,
+                           const object_manager::protocol::ObjectInfoT &));
 
  private:
   std::vector<std::pair<ObjectID, OnLocationsFound>> callbacks_;
-  std::unordered_map<ObjectID, std::vector<ClientID>> locations_;
+  std::unordered_map<ObjectID, std::unordered_set<ClientID>> locations_;
 };
 
 class MockGcs : public gcs::PubsubInterface<TaskID>,
@@ -65,7 +82,7 @@ class MockGcs : public gcs::PubsubInterface<TaskID>,
     failure_callback_ = failure_callback;
   }
 
-  void Add(const JobID &job_id, const TaskID &task_id,
+  void Add(const DriverID &driver_id, const TaskID &task_id,
            std::shared_ptr<TaskLeaseDataT> &task_lease_data) {
     task_lease_table_[task_id] = task_lease_data;
     if (subscribed_tasks_.count(task_id) == 1) {
@@ -73,7 +90,7 @@ class MockGcs : public gcs::PubsubInterface<TaskID>,
     }
   }
 
-  Status RequestNotifications(const JobID &job_id, const TaskID &task_id,
+  Status RequestNotifications(const DriverID &driver_id, const TaskID &task_id,
                               const ClientID &client_id) {
     subscribed_tasks_.insert(task_id);
     auto entry = task_lease_table_.find(task_id);
@@ -85,14 +102,14 @@ class MockGcs : public gcs::PubsubInterface<TaskID>,
     return ray::Status::OK();
   }
 
-  Status CancelNotifications(const JobID &job_id, const TaskID &task_id,
+  Status CancelNotifications(const DriverID &driver_id, const TaskID &task_id,
                              const ClientID &client_id) {
     subscribed_tasks_.erase(task_id);
     return ray::Status::OK();
   }
 
   Status AppendAt(
-      const JobID &job_id, const TaskID &task_id,
+      const DriverID &driver_id, const TaskID &task_id,
       std::shared_ptr<TaskReconstructionDataT> &task_data,
       const ray::gcs::LogInterface<TaskID, TaskReconstructionData>::WriteCallback
           &success_callback,
@@ -115,7 +132,7 @@ class MockGcs : public gcs::PubsubInterface<TaskID>,
   MOCK_METHOD4(
       Append,
       ray::Status(
-          const JobID &, const TaskID &, std::shared_ptr<TaskReconstructionDataT> &,
+          const DriverID &, const TaskID &, std::shared_ptr<TaskReconstructionDataT> &,
           const ray::gcs::LogInterface<TaskID, TaskReconstructionData>::WriteCallback &));
 
  private:
@@ -207,8 +224,7 @@ class ReconstructionPolicyTest : public ::testing::Test {
 
 TEST_F(ReconstructionPolicyTest, TestReconstructionSimple) {
   TaskID task_id = TaskID::from_random();
-  task_id = FinishTaskId(task_id);
-  ObjectID object_id = ComputeReturnId(task_id, 1);
+  ObjectID object_id = ObjectID::for_task_return(task_id, 1);
 
   // Listen for an object.
   reconstruction_policy_->ListenAndMaybeReconstruct(object_id);
@@ -226,8 +242,7 @@ TEST_F(ReconstructionPolicyTest, TestReconstructionSimple) {
 
 TEST_F(ReconstructionPolicyTest, TestReconstructionEvicted) {
   TaskID task_id = TaskID::from_random();
-  task_id = FinishTaskId(task_id);
-  ObjectID object_id = ComputeReturnId(task_id, 1);
+  ObjectID object_id = ObjectID::for_task_return(task_id, 1);
   mock_object_directory_->SetObjectLocations(object_id, {ClientID::from_random()});
 
   // Listen for both objects.
@@ -239,7 +254,31 @@ TEST_F(ReconstructionPolicyTest, TestReconstructionEvicted) {
   ASSERT_EQ(reconstructed_tasks_[task_id], 0);
 
   // Simulate evicting one of the objects.
-  mock_object_directory_->SetObjectLocations(object_id, {});
+  mock_object_directory_->SetObjectLocations(object_id,
+                                             std::unordered_set<ray::ClientID>());
+  // Run the test again.
+  Run(reconstruction_timeout_ms_ * 1.1);
+  // Check that reconstruction was triggered, since one of the objects was
+  // evicted.
+  ASSERT_EQ(reconstructed_tasks_[task_id], 1);
+}
+
+TEST_F(ReconstructionPolicyTest, TestReconstructionObjectLost) {
+  TaskID task_id = TaskID::from_random();
+  ObjectID object_id = ObjectID::for_task_return(task_id, 1);
+  ClientID client_id = ClientID::from_random();
+  mock_object_directory_->SetObjectLocations(object_id, {client_id});
+
+  // Listen for both objects.
+  reconstruction_policy_->ListenAndMaybeReconstruct(object_id);
+  // Run the test for longer than the reconstruction timeout.
+  Run(reconstruction_timeout_ms_ * 1.1);
+  // Check that reconstruction was not triggered, since the objects still
+  // exist on a live node.
+  ASSERT_EQ(reconstructed_tasks_[task_id], 0);
+
+  // Simulate evicting one of the objects.
+  mock_object_directory_->HandleClientRemoved(client_id);
   // Run the test again.
   Run(reconstruction_timeout_ms_ * 1.1);
   // Check that reconstruction was triggered, since one of the objects was
@@ -250,9 +289,8 @@ TEST_F(ReconstructionPolicyTest, TestReconstructionEvicted) {
 TEST_F(ReconstructionPolicyTest, TestDuplicateReconstruction) {
   // Create two object IDs produced by the same task.
   TaskID task_id = TaskID::from_random();
-  task_id = FinishTaskId(task_id);
-  ObjectID object_id1 = ComputeReturnId(task_id, 1);
-  ObjectID object_id2 = ComputeReturnId(task_id, 2);
+  ObjectID object_id1 = ObjectID::for_task_return(task_id, 1);
+  ObjectID object_id2 = ObjectID::for_task_return(task_id, 2);
 
   // Listen for both objects.
   reconstruction_policy_->ListenAndMaybeReconstruct(object_id1);
@@ -271,8 +309,7 @@ TEST_F(ReconstructionPolicyTest, TestDuplicateReconstruction) {
 
 TEST_F(ReconstructionPolicyTest, TestReconstructionSuppressed) {
   TaskID task_id = TaskID::from_random();
-  task_id = FinishTaskId(task_id);
-  ObjectID object_id = ComputeReturnId(task_id, 1);
+  ObjectID object_id = ObjectID::for_task_return(task_id, 1);
   // Run the test for much longer than the reconstruction timeout.
   int64_t test_period = 2 * reconstruction_timeout_ms_;
 
@@ -298,8 +335,7 @@ TEST_F(ReconstructionPolicyTest, TestReconstructionSuppressed) {
 
 TEST_F(ReconstructionPolicyTest, TestReconstructionContinuallySuppressed) {
   TaskID task_id = TaskID::from_random();
-  task_id = FinishTaskId(task_id);
-  ObjectID object_id = ComputeReturnId(task_id, 1);
+  ObjectID object_id = ObjectID::for_task_return(task_id, 1);
 
   // Listen for an object.
   reconstruction_policy_->ListenAndMaybeReconstruct(object_id);
@@ -326,8 +362,7 @@ TEST_F(ReconstructionPolicyTest, TestReconstructionContinuallySuppressed) {
 
 TEST_F(ReconstructionPolicyTest, TestReconstructionCanceled) {
   TaskID task_id = TaskID::from_random();
-  task_id = FinishTaskId(task_id);
-  ObjectID object_id = ComputeReturnId(task_id, 1);
+  ObjectID object_id = ObjectID::for_task_return(task_id, 1);
 
   // Listen for an object.
   reconstruction_policy_->ListenAndMaybeReconstruct(object_id);
@@ -353,8 +388,7 @@ TEST_F(ReconstructionPolicyTest, TestReconstructionCanceled) {
 
 TEST_F(ReconstructionPolicyTest, TestSimultaneousReconstructionSuppressed) {
   TaskID task_id = TaskID::from_random();
-  task_id = FinishTaskId(task_id);
-  ObjectID object_id = ComputeReturnId(task_id, 1);
+  ObjectID object_id = ObjectID::for_task_return(task_id, 1);
 
   // Log a reconstruction attempt to simulate a different node attempting the
   // reconstruction first. This should suppress this node's first attempt at

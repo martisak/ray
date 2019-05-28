@@ -10,12 +10,13 @@
 #include <boost/bind.hpp>
 #include <boost/enable_shared_from_this.hpp>
 
-#include "common/state/ray_config.h"
 #include "ray/common/client_connection.h"
 #include "ray/id.h"
+#include "ray/ray_config.h"
 
 namespace ray {
 
+// TODO(ekl) this class can be replaced with a plain ClientConnection
 class SenderConnection : public boost::enable_shared_from_this<SenderConnection> {
  public:
   /// Create a connection for sending data to other object managers.
@@ -44,10 +45,21 @@ class SenderConnection : public boost::enable_shared_from_this<SenderConnection>
     return conn_->WriteMessage(type, length, message);
   }
 
+  /// Write a message to the client asynchronously.
+  ///
+  /// \param type The message type (e.g., a flatbuffer enum).
+  /// \param length The size in bytes of the message.
+  /// \param message A pointer to the message buffer.
+  /// \param handler A callback to run on write completion.
+  void WriteMessageAsync(int64_t type, int64_t length, const uint8_t *message,
+                         const std::function<void(const ray::Status &)> &handler) {
+    conn_->WriteMessageAsync(type, length, message, handler);
+  }
+
   /// Write a buffer to this connection.
   ///
   /// \param buffer The buffer.
-  /// \param ec The error code object in which to store error codes.
+  /// \return Status.
   Status WriteBuffer(const std::vector<boost::asio::const_buffer> &buffer) {
     return conn_->WriteBuffer(buffer);
   }
@@ -55,14 +67,13 @@ class SenderConnection : public boost::enable_shared_from_this<SenderConnection>
   /// Read a buffer from this connection.
   ///
   /// \param buffer The buffer.
-  /// \param ec The error code object in which to store error codes.
-  void ReadBuffer(const std::vector<boost::asio::mutable_buffer> &buffer,
-                  boost::system::error_code &ec) {
-    return conn_->ReadBuffer(buffer, ec);
+  /// \return Status.
+  Status ReadBuffer(const std::vector<boost::asio::mutable_buffer> &buffer) {
+    return conn_->ReadBuffer(buffer);
   }
 
   /// \return The ClientID of this connection.
-  const ClientID &GetClientID() { return client_id_; }
+  const ClientID &GetClientId() { return client_id_; }
 
  private:
   bool operator==(const SenderConnection &rhs) const {

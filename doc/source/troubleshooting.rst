@@ -39,13 +39,17 @@ application! The most common reasons are the following.
 
 - **Multi-threaded libraries:** Are all of your tasks attempting to use all of
   the cores on the machine? If so, they are likely to experience contention and
-  prevent your application from achieving a speedup. You can diagnose this by
-  opening ``top`` while your application is running. If one process is using
-  most of the CPUs, and the others are using a small amount, this may be the
-  problem. This is very common with some versions of ``numpy``, and in that case
-  can usually be setting an environment variable like ``MKL_NUM_THREADS`` (or
-  the equivalent depending on your installation) to ``1``.
+  prevent your application from achieving a speedup. This is very common with 
+  some versions of ``numpy``, and in that case can usually be setting an 
+  environment variable like ``MKL_NUM_THREADS`` (or the equivalent depending 
+  on your installation) to ``1``.
 
+  For many - but not all - libraries, you can diagnose this by opening ``top`` 
+  while your application is running. If one process is using most of the CPUs, 
+  and the others are using a small amount, this may be the problem. The most
+  common exception is PyTorch, which will appear to be using all the cores 
+  despite needing ``torch.set_num_threads(1)`` to be called to avoid contention.
+  
 If you are still experiencing a slowdown, but none of the above problems apply,
 we'd really like to know! Please create a `GitHub issue`_ and consider
 submitting a minimal code example that demonstrates the problem.
@@ -61,10 +65,10 @@ of the following reasons.
 - **Stressful workloads:** Workloads that create many many tasks in a short
   amount of time can sometimes interfere with the heartbeat mechanism that we
   use to check that processes are still alive. On the head node in the cluster,
-  you can check the files ``/tmp/raylogs/monitor-******.out`` and
-  ``/tmp/raylogs/monitor-******.err``. They will indicate which processes Ray
-  has marked as dead (due to a lack of heartbeats). However, it is currently
-  possible for a process to get marked as dead without actually having died.
+  you can check the files ``/tmp/ray/session_*/logs/monitor*``. They will
+  indicate which processes Ray has marked as dead (due to a lack of heartbeats).
+  However, it is currently possible for a process to get marked as dead without
+  actually having died.
 
 - **Starting many actors:** Workloads that start a large number of actors all at
   once may exhibit problems when the processes (or libraries that they use)
@@ -91,6 +95,11 @@ of the following reasons.
 
 Hanging
 -------
+
+.. tip::
+    
+    You can run ``ray stack`` to dump the stack traces of all Ray workers on
+    the current node. This requires py-spy to be installed.
 
 If a workload is hanging and not progressing, the problem may be one of the
 following.

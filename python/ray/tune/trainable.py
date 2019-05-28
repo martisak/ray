@@ -4,10 +4,12 @@ from __future__ import print_function
 
 from datetime import datetime
 
-import gzip
+import copy
 import io
+import logging
 import os
 import pickle
+from six import string_types
 import shutil
 import tempfile
 import time
@@ -16,8 +18,12 @@ import uuid
 import ray
 from ray.tune.logger import UnifiedLogger
 from ray.tune.result import (DEFAULT_RESULTS_DIR, TIME_THIS_ITER_S,
-                             TIMESTEPS_THIS_ITER, DONE, TIMESTEPS_TOTAL)
+                             TIMESTEPS_THIS_ITER, DONE, TIMESTEPS_TOTAL,
+                             EPISODES_THIS_ITER, EPISODES_TOTAL,
+                             TRAINING_ITERATION, RESULT_DUPLICATE)
 from ray.tune.trial import Resources
+
+logger = logging.getLogger(__name__)
 
 
 class Trainable(object):
@@ -36,31 +42,27 @@ class Trainable(object):
 
     Note that, if you don't require checkpoint/restore functionality, then
     instead of implementing this class you can also get away with supplying
-    just a `my_train(config, reporter)` function and calling:
-
-    ``register_trainable("my_func", train)``
-
-    to register it for use with Tune. The function will be automatically
-    converted to this interface (sans checkpoint functionality).
-
-    Attributes:
-        config (obj): The hyperparam configuration for this trial.
-        logdir (str): Directory in which training outputs should be placed.
+    just a ``my_train(config, reporter)`` function to the config.
+    The function will be automatically converted to this interface
+    (sans checkpoint functionality).
     """
 
     def __init__(self, config=None, logger_creator=None):
         """Initialize an Trainable.
 
+        Sets up logging and points ``self.logdir`` to a directory in which
+        training outputs should be placed.
+
         Subclasses should prefer defining ``_setup()`` instead of overriding
         ``__init__()`` directly.
 
         Args:
-            config (dict): Trainable-specific configuration data.
+            config (dict): Trainable-specific configuration data. By default
+                will be saved as ``self.config``.
             logger_creator (func): Function that creates a ray.tune.Logger
                 object. If unspecified, a default logger is created.
         """
 
-        self._initialize_ok = False
         self._experiment_id = uuid.uuid4().hex
         self.config = config or {}
 
@@ -77,9 +79,13 @@ class Trainable(object):
 
         self._iteration = 0
         self._time_total = 0.0
-        self._timesteps_total = 0
-        self._setup()
-        self._initialize_ok = True
+        self._timesteps_total = None
+        self._episodes_total = None
+        self._time_since_restore = 0.0
+        self._timesteps_since_restore = 0
+        self._iterations_since_restore = 0
+        self._restored = False
+        self._setup(copy.deepcopy(self.config))
         self._local_ip = ray.services.get_node_ip_address()
 
     @classmethod
@@ -98,57 +104,88 @@ class Trainable(object):
 
         return ""
 
+    def current_ip(self):
+        self._local_ip = ray.services.get_node_ip_address()
+        return self._local_ip
+
     def train(self):
         """Runs one logical iteration of training.
 
         Subclasses should override ``_train()`` instead to return results.
-
         This class automatically fills the following fields in the result:
-            done (bool): training is terminated. Filled only if not provided.
-            time_this_iter_s (float): Time in seconds
-                this iteration took to run. This may be overriden in order to
-                override the system-computed time difference.
-            time_total_s (float): Accumulated time in seconds
-                for this entire experiment.
-            experiment_id (str): Unique string identifier
-                for this experiment. This id is preserved
-                across checkpoint / restore calls.
-            training_iteration (int): The index of this
-                training iteration, e.g. call to train().
-            pid (str): The pid of the training process.
-            date (str): A formatted date of
-                when the result was processed.
-            timestamp (str): A UNIX timestamp of
-                when the result was processed.
-            hostname (str): The hostname of the machine
-                hosting the training process.
-            node_ip (str): The node ip of the machine
-                hosting the training process.
+
+            `done` (bool): training is terminated. Filled only if not provided.
+
+            `time_this_iter_s` (float): Time in seconds this iteration
+            took to run. This may be overriden in order to override the
+            system-computed time difference.
+
+            `time_total_s` (float): Accumulated time in seconds for this
+            entire experiment.
+
+            `experiment_id` (str): Unique string identifier
+            for this experiment. This id is preserved
+            across checkpoint / restore calls.
+
+            `training_iteration` (int): The index of this
+            training iteration, e.g. call to train().
+
+            `pid` (str): The pid of the training process.
+
+            `date` (str): A formatted date of when the result was processed.
+
+            `timestamp` (str): A UNIX timestamp of when the result
+            was processed.
+
+            `hostname` (str): Hostname of the machine hosting the training
+            process.
+
+            `node_ip` (str): Node ip of the machine hosting the training
+            process.
 
         Returns:
             A dict that describes training progress.
         """
 
-        if not self._initialize_ok:
-            raise ValueError(
-                "Trainable initialization failed, see previous errors")
-
         start = time.time()
         result = self._train()
+        assert isinstance(result, dict), "_train() needs to return a dict."
+
+        # We do not modify internal state nor update this result if duplicate.
+        if RESULT_DUPLICATE in result:
+            return result
+
         result = result.copy()
 
         self._iteration += 1
+        self._iterations_since_restore += 1
 
         if result.get(TIME_THIS_ITER_S) is not None:
             time_this_iter = result[TIME_THIS_ITER_S]
         else:
             time_this_iter = time.time() - start
         self._time_total += time_this_iter
-
-        self._timesteps_total += result.get(TIMESTEPS_THIS_ITER, 0)
+        self._time_since_restore += time_this_iter
 
         result.setdefault(DONE, False)
+
+        # self._timesteps_total should only be tracked if increments provided
+        if result.get(TIMESTEPS_THIS_ITER) is not None:
+            if self._timesteps_total is None:
+                self._timesteps_total = 0
+            self._timesteps_total += result[TIMESTEPS_THIS_ITER]
+            self._timesteps_since_restore += result[TIMESTEPS_THIS_ITER]
+
+        # self._episodes_total should only be tracked if increments provided
+        if result.get(EPISODES_THIS_ITER) is not None:
+            if self._episodes_total is None:
+                self._episodes_total = 0
+            self._episodes_total += result[EPISODES_THIS_ITER]
+
+        # self._timesteps_total should not override user-provided total
         result.setdefault(TIMESTEPS_TOTAL, self._timesteps_total)
+        result.setdefault(EPISODES_TOTAL, self._episodes_total)
+        result.setdefault(TRAINING_ITERATION, self._iteration)
 
         # Provides auto-filled neg_mean_loss for avoiding regressions
         if result.get("mean_loss"):
@@ -159,17 +196,30 @@ class Trainable(object):
             experiment_id=self._experiment_id,
             date=now.strftime("%Y-%m-%d_%H-%M-%S"),
             timestamp=int(time.mktime(now.timetuple())),
-            training_iteration=self._iteration,
             time_this_iter_s=time_this_iter,
             time_total_s=self._time_total,
             pid=os.getpid(),
             hostname=os.uname()[1],
             node_ip=self._local_ip,
-            config=self.config)
+            config=self.config,
+            time_since_restore=self._time_since_restore,
+            timesteps_since_restore=self._timesteps_since_restore,
+            iterations_since_restore=self._iterations_since_restore)
 
-        self._result_logger.on_result(result)
+        self._log_result(result)
 
         return result
+
+    def delete_checkpoint(self, checkpoint_dir):
+        """Removes subdirectory within checkpoint_folder
+        Parameters
+        ----------
+            checkpoint_dir : path to checkpoint
+        """
+        if os.path.isfile(checkpoint_dir):
+            shutil.rmtree(os.path.dirname(checkpoint_dir))
+        else:
+            shutil.rmtree(checkpoint_dir)
 
     def save(self, checkpoint_dir=None):
         """Saves the current model state to a checkpoint.
@@ -184,11 +234,42 @@ class Trainable(object):
             Checkpoint path that may be passed to restore().
         """
 
-        checkpoint_path = self._save(checkpoint_dir or self.logdir)
-        pickle.dump([
-            self._experiment_id, self._iteration, self._timesteps_total,
-            self._time_total
-        ], open(checkpoint_path + ".tune_metadata", "wb"))
+        checkpoint_dir = os.path.join(checkpoint_dir or self.logdir,
+                                      "checkpoint_{}".format(self._iteration))
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        checkpoint = self._save(checkpoint_dir)
+        saved_as_dict = False
+        if isinstance(checkpoint, string_types):
+            if (not checkpoint.startswith(checkpoint_dir)
+                    or checkpoint == checkpoint_dir):
+                raise ValueError(
+                    "The returned checkpoint path must be within the "
+                    "given checkpoint dir {}: {}".format(
+                        checkpoint_dir, checkpoint))
+            if not os.path.exists(checkpoint):
+                raise ValueError(
+                    "The returned checkpoint path does not exist: {}".format(
+                        checkpoint))
+            checkpoint_path = checkpoint
+        elif isinstance(checkpoint, dict):
+            saved_as_dict = True
+            checkpoint_path = os.path.join(checkpoint_dir, "checkpoint")
+            with open(checkpoint_path, "wb") as f:
+                pickle.dump(checkpoint, f)
+        else:
+            raise ValueError(
+                "`_save` must return a dict or string type: {}".format(
+                    str(type(checkpoint))))
+        with open(checkpoint_path + ".tune_metadata", "wb") as f:
+            pickle.dump({
+                "experiment_id": self._experiment_id,
+                "iteration": self._iteration,
+                "timesteps_total": self._timesteps_total,
+                "time_total": self._time_total,
+                "episodes_total": self._episodes_total,
+                "saved_as_dict": saved_as_dict
+            }, f)
         return checkpoint_path
 
     def save_to_object(self):
@@ -207,17 +288,17 @@ class Trainable(object):
         for path in os.listdir(base_dir):
             path = os.path.join(base_dir, path)
             if path.startswith(checkpoint_prefix):
-                data[os.path.basename(path)] = open(path, "rb").read()
+                with open(path, "rb") as f:
+                    data[os.path.basename(path)] = f.read()
 
         out = io.BytesIO()
-        with gzip.GzipFile(fileobj=out, mode="wb") as f:
-            compressed = pickle.dumps({
-                "checkpoint_name": os.path.basename(checkpoint_prefix),
-                "data": data,
-            })
-            if len(compressed) > 10e6:  # getting pretty large
-                print("Checkpoint size is {} bytes".format(len(compressed)))
-            f.write(compressed)
+        data_dict = pickle.dumps({
+            "checkpoint_name": os.path.basename(checkpoint_prefix),
+            "data": data,
+        })
+        if len(data_dict) > 10e6:  # getting pretty large
+            logger.info("Checkpoint size is {} bytes".format(len(data_dict)))
+        out.write(data_dict)
 
         shutil.rmtree(tmpdir)
         return out.getvalue()
@@ -231,12 +312,24 @@ class Trainable(object):
         This method restores additional metadata saved with the checkpoint.
         """
 
-        self._restore(checkpoint_path)
-        metadata = pickle.load(open(checkpoint_path + ".tune_metadata", "rb"))
-        self._experiment_id = metadata[0]
-        self._iteration = metadata[1]
-        self._timesteps_total = metadata[2]
-        self._time_total = metadata[3]
+        with open(checkpoint_path + ".tune_metadata", "rb") as f:
+            metadata = pickle.load(f)
+        self._experiment_id = metadata["experiment_id"]
+        self._iteration = metadata["iteration"]
+        self._timesteps_total = metadata["timesteps_total"]
+        self._time_total = metadata["time_total"]
+        self._episodes_total = metadata["episodes_total"]
+        saved_as_dict = metadata["saved_as_dict"]
+        if saved_as_dict:
+            with open(checkpoint_path, "rb") as loaded_state:
+                checkpoint_dict = pickle.load(loaded_state)
+            self._restore(checkpoint_dict)
+        else:
+            self._restore(checkpoint_path)
+        self._time_since_restore = 0.0
+        self._timesteps_since_restore = 0
+        self._iterations_since_restore = 0
+        self._restored = True
 
     def restore_from_object(self, obj):
         """Restores training state from a checkpoint object.
@@ -244,8 +337,7 @@ class Trainable(object):
         These checkpoints are returned from calls to save_to_object().
         """
 
-        out = io.BytesIO(obj)
-        info = pickle.loads(gzip.GzipFile(fileobj=out, mode="rb").read())
+        info = pickle.loads(obj)
         data = info["data"]
         tmpdir = tempfile.mkdtemp("restore_from_object", dir=self.logdir)
         checkpoint_path = os.path.join(tmpdir, info["checkpoint_name"])
@@ -257,12 +349,44 @@ class Trainable(object):
         self.restore(checkpoint_path)
         shutil.rmtree(tmpdir)
 
+    def export_model(self, export_formats, export_dir=None):
+        """Exports model based on export_formats.
+
+        Subclasses should override _export_model() to actually
+        export model to local directory.
+
+        Args:
+            export_formats (list): List of formats that should be exported.
+            export_dir (str): Optional dir to place the exported model.
+                Defaults to self.logdir.
+
+        Return:
+            A dict that maps ExportFormats to successfully exported models.
+        """
+        export_dir = export_dir or self.logdir
+        return self._export_model(export_formats, export_dir)
+
+    def reset_config(self, new_config):
+        """Resets configuration without restarting the trial.
+
+        This method is optional, but can be implemented to speed up algorithms
+        such as PBT, and to allow performance optimizations such as running
+        experiments with reuse_actors=True.
+
+        Args:
+            new_config (dir): Updated hyperparameter configuration
+                for the trainable.
+
+        Returns:
+            True if reset was successful else False.
+        """
+        return False
+
     def stop(self):
         """Releases all resources used by this trainable."""
 
-        if self._initialize_ok:
-            self._result_logger.close()
-            self._stop()
+        self._result_logger.close()
+        self._stop()
 
     def _train(self):
         """Subclasses should override this to implement train().
@@ -273,29 +397,67 @@ class Trainable(object):
         raise NotImplementedError
 
     def _save(self, checkpoint_dir):
-        """Subclasses should override this to implement save()."""
+        """Subclasses should override this to implement save().
+
+        Args:
+            checkpoint_dir (str): The directory where the checkpoint
+                file must be stored.
+
+        Returns:
+            checkpoint (str | dict): If string, the return value is
+                expected to be the checkpoint path that will be passed to
+                `_restore()`. If dict, the return value will be automatically
+                serialized by Tune and passed to `_restore()`.
+
+        Examples:
+            >>> print(trainable1._save("/tmp/checkpoint_1"))
+            "/tmp/checkpoint_1/my_checkpoint_file"
+            >>> print(trainable2._save("/tmp/checkpoint_2"))
+            {"some": "data"}
+        """
 
         raise NotImplementedError
 
-    def _restore(self, checkpoint_path):
-        """Subclasses should override this to implement restore()."""
+    def _restore(self, checkpoint):
+        """Subclasses should override this to implement restore().
+
+        Args:
+            checkpoint (str | dict): Value as returned by `_save`.
+                If a string, then it is the checkpoint path.
+        """
 
         raise NotImplementedError
 
-    def _setup(self):
-        """Subclasses should override this for custom initialization."""
+    def _setup(self, config):
+        """Subclasses should override this for custom initialization.
+
+        Args:
+            config (dict): Hyperparameters and other configs given.
+                Copy of `self.config`.
+        """
         pass
+
+    def _log_result(self, result):
+        """Subclasses can optionally override this to customize logging.
+
+        Args:
+            result (dict): Training result returned by _train().
+        """
+
+        self._result_logger.on_result(result)
 
     def _stop(self):
         """Subclasses should override this for any cleanup on stop."""
         pass
 
+    def _export_model(self, export_formats, export_dir):
+        """Subclasses should override this to export model.
 
-def wrap_function(train_func):
-    from ray.tune.function_runner import FunctionRunner
+        Args:
+            export_formats (list): List of formats that should be exported.
+            export_dir (str): Directory to place exported models.
 
-    class WrappedFunc(FunctionRunner):
-        def _trainable_func(self):
-            return train_func
-
-    return WrappedFunc
+        Return:
+            A dict that maps ExportFormats to successfully exported models.
+        """
+        return {}

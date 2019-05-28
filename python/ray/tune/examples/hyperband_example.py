@@ -12,9 +12,8 @@ import random
 import numpy as np
 
 import ray
-from ray.tune import Trainable, register_trainable, \
-    run_experiments, Experiment
-from ray.tune.hyperband import HyperBandScheduler
+from ray.tune import Trainable, run, Experiment, sample_from
+from ray.tune.schedulers import HyperBandScheduler
 
 
 class MyTrainableClass(Trainable):
@@ -24,7 +23,7 @@ class MyTrainableClass(Trainable):
     maximum reward value reached.
     """
 
-    def _setup(self):
+    def _setup(self, config):
         self.timestep = 0
 
     def _train(self):
@@ -47,8 +46,6 @@ class MyTrainableClass(Trainable):
             self.timestep = json.loads(f.read())["timestep"]
 
 
-register_trainable("my_class", MyTrainableClass)
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -66,12 +63,12 @@ if __name__ == "__main__":
 
     exp = Experiment(
         name="hyperband_test",
-        run="my_class",
-        repeat=20,
+        run=MyTrainableClass,
+        num_samples=20,
         stop={"training_iteration": 1 if args.smoke_test else 99999},
         config={
-            "width": lambda spec: 10 + int(90 * random.random()),
-            "height": lambda spec: int(100 * random.random())
+            "width": sample_from(lambda spec: 10 + int(90 * random.random())),
+            "height": sample_from(lambda spec: int(100 * random.random()))
         })
 
-    run_experiments(exp, scheduler=hyperband)
+    run(exp, scheduler=hyperband)
